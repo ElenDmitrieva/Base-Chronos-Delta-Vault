@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ChronosDeltaVault {
+    struct Tranche {
+        uint256 principal;
+        uint256 accumulatedYield;
+        uint256 unlockTimestamp;
+        uint256 lastCompoundTimestamp;
+        bool isActive;
+    }
+
+    address payable public immutable vaultDirector;
+    string public vaultIdentifier;
+    uint256 public baseYieldBps; // 400 = 4% APR
+    uint256 public penaltyBps; // 500 = 5% штраф за ранний выход
+    uint256 public totalVaultDeposits;
+    uint256 public reserveSurplus;
+
+    mapping(address => Tranche) public tranches;
+
+    event TrancheFunded(address indexed account, uint256 amount, uint256 unlockTime);
+    event YieldCompounded(address indexed account, uint256 addedYield);
+    event TrancheRebalanced(address indexed account, uint256 newUnlockTime);
+    event TrancheExited(address indexed account, uint256 netPayout, uint256 penaltyCharged);
+    event RiskParamsUpdated(uint256 newYieldBps, uint256 newPenaltyBps);
+    event SurplusHarvested(address indexed receiver, uint256 amount);
+
+    modifier onlyDirector() {
+        require(msg.sender == vaultDirector, "ChronosDelta: Access denied");
+        _;
+    }
+
+    constructor() {
+        vaultDirector = payable(msg.sender);
+        vaultIdentifier = "Chronos Base Delta-Neutral Vault v1";
+        baseYieldBps = 450; // 4.5%
+        penaltyBps = 500;   // 5%
+    }
+
+    // 1. Внесение средств в инвестиционный транш
+    function fundCapitalTranche(uint256 lockDurationSeconds) external payable {
+        require(msg.value > 0, "ChronosDelta: Zero deposit forbidden");
+        require(lockDurationSeconds >= 60, "ChronosDelta: Minimum lock duration 60s");
+
+        Tranche storage t = tranches[msg.sender];
+        uint256 unlock = block.timestamp + lockDurationSeconds;
+
+        if (t.isActive) {
+            t.principal += msg.value;
+            if (unlock > t.unlockTimestamp) {
+                t.unlockTimestamp = unlock;
+            }
+        } else {
+            tranches[msg.sender] = Tranche({
+                principal: msg.value,
+                accumulatedYield: 0,
+                unlockTimestamp: unlock,
+                lastCompoundTimestamp: block.timestamp,
+                isActive: true
+            });
+        }
+
+        totalVaultDeposits += msg.value;
+        emit TrancheFunded(msg.sender, msg.value, unlock);
+    }
+
+    // 2. Реинвестирование расчетного дохода
+    function compoundYield() external {
+        Tranche storage t = tranches[msg.sender];
+        require(t.isActive, "ChronosDelta: No active tranche");
+
+        uint256 timeElapsed = block.timestamp - t.lastCompoundTimestamp;
+        require(timeElapsed > 0, "ChronosDelta: No time elapsed");
+
+        uint256 calculatedYield = (t.principal * baseYieldBps * timeElapsed) / (365 days * 10000);
+        t.accumulatedYield += calculatedYield;
+        t.lastCompoundTimestamp = block.timestamp;
+
+        emit YieldCompounded(msg.sender, calculatedYield);
+    }
+
+    // 3. Перебалансировка параметров транша (продление локапа)
+    function rebalanceTranche(uint256 extendLockSeconds) external {
+        Tranche storage t = tranches[msg.sender];
+        require(t.isActive, "ChronosDelta: Tranche inactive");
+        require(extendLockSeconds > 0, "ChronosDelta: Extra seconds required");
+
+        t.unlockTimestamp += extendLockSeconds;
+        emit TrancheRebalanced(msg.sender, t.unlockTimestamp);
+    }
+
+    // 4. Досрочный вывод с удержанием штрафа
+    function earlyExitTranche() external {
+        Tranche storage t = tranches[msg.sender];
+        require(t.isActive, "ChronosDelta: Tranche inactive");
+
+        uint256 totalBalance = t.principal;
+        uint256 penalty = 0;
+
+        if (block.timestamp < t.unlockTimestamp) {
+            penalty = (totalBalance * penaltyBps) / 10000;
+        }
+
+        uint256 netPayout = totalBalance - penalty;
+        reserveSurplus += penalty;
+        totalVaultDeposits -= totalBalance;
+
+        t.principal = 0;
+        t.accumulatedYield = 0;
+        t.isActive = false;
+
+        (bool sent, ) = payable(msg.sender).call{value: netPayout}("");
+        require(sent, "ChronosDelta: Payout failed");
+
+        emit TrancheExited(msg.sender, netPayout, penalty);
+    }
+
+    // 5. Корректировка параметров риска директором
+    function configureRiskParams(uint256 newYieldBps, uint256 newPenaltyBps) external onlyDirector {
+        require(newYieldBps <= 2000, "ChronosDelta: Max yield 20%");
+        require(newPenaltyBps <= 2500, "ChronosDelta: Max penalty 25%");
+
+        baseYieldBps = newYieldBps;
+        penaltyBps = newPenaltyBps;
+
+        emit RiskParamsUpdated(newYieldBps, newPenaltyBps);
+    }
+
+    // 6. Сбор штрафного резерва обратно директору
+    function harvestSurplus() external onlyDirector {
+        uint256 available = reserveSurplus;
+        require(available > 0, "ChronosDelta: No surplus to harvest");
+
+        reserveSurplus = 0;
+        (bool sent, ) = vaultDirector.call{value: available}("");
+        require(sent, "ChronosDelta: Harvest failed");
+
+        emit SurplusHarvested(vaultDirector, available);
+    }
+
+    // Чтение информации о транше
+    function getTrancheInfo(address account) external view returns (
+        uint256 principal,
+        uint256 accumulatedYield,
+        uint256 unlockTimestamp,
+        bool isUnlocked,
+        bool isActive
+    ) {
+        Tranche memory t = tranches[account];
+        return (t.principal, t.accumulatedYield, t.unlockTimestamp, block.timestamp >= t.unlockTimestamp, t.isActive);
+    }
+}
